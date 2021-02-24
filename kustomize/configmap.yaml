@@ -1,0 +1,16 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: varnish-cmd
+data:
+  config.yaml: |
+    redis:
+      host: redis.default.svc.cluster.local
+      port: 6379
+      password: ""
+      db: 5
+    channel: varnish-cmd
+    varnish:
+      namespace: varnish
+      service_name: cache-service
+      container_name: cache-service

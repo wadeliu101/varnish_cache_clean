@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: varnish-cmd
+  labels:
+    app: varnish-cmd
+spec:
+  selector:
+    matchLabels:
+      app: varnish-cmd
+  replicas: 1
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: varnish-cmd
+    spec:
+      serviceAccountName: argocd-manager
+      containers:
+      - name: varnish-cmd
+        image: asia.gcr.io/pl-web-219210/varnish-cmd:latest
+        resources:
+          requests:
+            cpu: 100m
+            memory: 100Mi
+          limits:
+            cpu: 100m
+            memory: 100Mi
+        volumeMounts:
+        - name: config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+      imagePullSecrets:
+      - name: gcr-json-key
+      volumes:
+      - name: config
+        configMap:
+          name: varnish-cmd
+          items:
+          - key: config.yaml
+            path: config.yaml
+      restartPolicy: Always

@@ -3,9 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"flag"
 	"fmt"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,12 +17,12 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
-	"k8s.io/client-go/util/homedir"
 )
 
 var ctx = context.Background()
+
+var cfg *Config
 
 var rdb *redis.Client
 
@@ -32,58 +30,44 @@ var restConfig *rest.Config
 
 var clientset *kubernetes.Clientset
 
-var varnishNamespace, varnishInstanceName, subscribeChannel *string
+var varnishNamespace, varnishServiceName, varnishContainerName, subscribeChannel string
 
 func init() {
-	var kubeconfig *string
-	redisHost := flag.String("redisHost", "127.0.0.1", "ip address or hostname of redis instance")
-	redisPort := flag.Int("redisPort", 6379, "port listened of redis instance")
-	redisPassword := flag.String("redisPassword", "", "authentication password of redis")
-	redisDB := flag.Int("redisDB", 0, "db index of redis")
-	subscribeChannel = flag.String("subscribeChannel", "cleanCache", "which channel will be subscribed")
-	varnishNamespace = flag.String("varnishNamespace", "varnish", "kubernetes namespace of varnish")
-	varnishInstanceName = flag.String("varnishServiceName", "cache-service", "kubernetes container name of varnish")
-	if home := homedir.HomeDir(); home != "" {
-		kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
-	} else {
-		kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
+	configfile, err := ParseFlags()
+
+	if err != nil {
+		fmt.Println(err)
+		panic("failed to parse configfile")
 	}
-	flag.Parse()
+
+	cfg, err = NewConfig(configfile)
+
+	if err != nil {
+		fmt.Println(err)
+		panic("failed to parse configfile")
+	}
 
 	rdb = redis.NewClient(&redis.Options{
-		Addr:     *redisHost + ":" + strconv.Itoa(*redisPort),
-		Password: *redisPassword, // no password set
-		DB:       *redisDB,       // use default DB
+		Addr:     cfg.Redis.Host + ":" + strconv.Itoa(cfg.Redis.Port),
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
 	})
-
-	var err error
 
 	restConfig, err = rest.InClusterConfig()
 
-	if err == nil {
-		clientset, err = kubernetes.NewForConfig(restConfig)
-
-		if err != nil {
-			panic(err.Error())
-		}
-	} else {
-		// use the current context in kubeconfig
-		restConfig, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
-
-		if err != nil {
-			panic(err.Error())
-		}
-
-		// create the clientset
-		clientset, err = kubernetes.NewForConfig(restConfig)
-		if err != nil {
-			panic(err.Error())
-		}
+	clientset, err = kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		panic(err.Error())
 	}
+
+	varnishNamespace = cfg.Varnish.Namespace
+	varnishServiceName = cfg.Varnish.ServiceName
+	varnishContainerName = cfg.Varnish.ContainerName
+	subscribeChannel = cfg.Channel
 }
 
 func main() {
-	pubsub := rdb.Subscribe(ctx, *subscribeChannel)
+	pubsub := rdb.Subscribe(ctx, subscribeChannel)
 
 	defer pubsub.Close()
 
@@ -92,7 +76,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	} else {
-		fmt.Printf("Sucessful Subscribe to Channel - %s\n", *subscribeChannel)
+		fmt.Printf("Sucessful Subscribe to Channel - %s\n", subscribeChannel)
 	}
 
 	// Go channel which receives messages.
@@ -100,14 +84,19 @@ func main() {
 
 	// Consume messages.
 	for msg := range ch {
-		kubeDNS, ok := getKubeDNS(clientset, msg.Payload)
-
-		if !ok {
-			fmt.Println("Service Not Found")
-			continue
+		var cmd string
+		if msg.Payload == "configReload" {
+			cmd = "varnishreload /etc/varnish/default.vcl"
+		} else {
+			kubeDNS, ok := getKubeDNS(clientset, msg.Payload)
+			if !ok {
+				fmt.Println("Service Not Found")
+				continue
+			}
+			cmd = "varnishadm ban req.http.host == " + kubeDNS
 		}
 
-		varnishPodList, err := clientset.CoreV1().Pods(*varnishNamespace).List(context.TODO(), metav1.ListOptions{})
+		varnishPodList, err := clientset.CoreV1().Pods(varnishNamespace).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			panic(err.Error())
 		}
@@ -116,17 +105,22 @@ func main() {
 
 		for _, varnishPod := range varnishPodList.Items {
 
-			Container, ok := getContainer(*varnishInstanceName, varnishPod)
+			Container, ok := getContainer(varnishContainerName, varnishPod)
 
 			if !ok {
 				continue
 			}
 			wg.Add(1)
-			go execInPod(restConfig, clientset, varnishPod.GetNamespace(), varnishPod.GetName(), "varnishadm ban req.http.host == "+kubeDNS, Container.Name, wg)
+			go execInPod(restConfig, clientset, varnishPod.Namespace, varnishPod.Name, cmd, Container.Name, wg)
 		}
 
 		wg.Wait()
-		fmt.Printf("Sucessful clean cache of %s\n", msg.Payload)
+
+		if msg.Payload == "configReload" {
+			fmt.Println("Sucessful reload config")
+		} else {
+			fmt.Printf("Sucessful clean cache of %s\n", msg.Payload)
+		}
 	}
 }
 
